@@ -89,14 +89,16 @@ The repo must be **public** for the in-app update check to work.
   maximum. Displayed duty is the requested value and RPM is optional telemetry.
   A successful API call does not prove the hardware changed modes or speed.
 - Polling uses a monotonic clock. An update or poll gap over three seconds triggers
-  a full-speed request at the next opportunity. LibreHardwareMonitor does not
+  a full-speed request at the next opportunity. The hardware worker polls separately
+  from the window, so moving the window does not suspend control. LibreHardwareMonitor does not
   expose a reliable timestamp for each sensor sample here. A cached value that
   remains plausible during successful polls can be indistinguishable from a steady
   temperature.
-- The polling timer runs inside FanForge. A blocked driver call, frozen process,
+- The hardware worker runs inside FanForge. A blocked driver call, frozen process,
   forced termination, Windows shutdown, or power loss can prevent the failsafe or
   cleanup from running. Firmware may retain the last duty setting. There is no
-  independent hardware watchdog or fan-stall interlock.
+  independent hardware watchdog or fan-stall interlock. On normal exit, the window
+  waits for the current driver call and firmware restore to finish.
 - The Windows mutex blocks a second FanForge instance across sessions. Other fan
   utilities can still contend for the same hardware. Run one controller at a time.
 

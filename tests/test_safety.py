@@ -1,11 +1,13 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from fanforge import App, Hardware, curve_value
+from fanforge import FanWorker, Hardware, curve_value
 from fanforge_safety import ARMED_KEY, Header, fresh_temperature, validate_config, write_config
 
 
@@ -32,27 +34,71 @@ class SafetyTests(unittest.TestCase):
         safe = Header(writes.append, Mock())
         failing = Header(Mock(side_effect=OSError()), Mock())
         inactive = Header(Mock(), Mock())
-        app = SimpleNamespace(
-            auto=Mock(), smooth=45, rows=[
-                {"enabled": Mock(get=lambda: True), "header": failing},
-                {"enabled": Mock(get=lambda: True), "header": safe},
-                {"enabled": Mock(get=lambda: False), "header": inactive},
-            ])
-        App._drive(app, None)
+        worker = FanWorker(Mock(), (("bad", failing, None), ("good", safe, None),
+                                    ("inactive", inactive, None)))
+        worker.drive(None, (((), 0), ((), 0), (None, 0)))
         self.assertEqual(writes, [100])
         failing.release.assert_called_once()
         inactive.write.assert_not_called()
         inactive.release.assert_not_called()
 
     def test_poll_exception_requests_full_speed(self):
-        app = SimpleNamespace(
-            hw=Mock(), after=Mock(), last_poll=None, closing=False, rows=[],
-            master_editor=None, temp_var=Mock(), status=Mock(), config_error="", _drive=Mock(), _tick=Mock(),
-        )
-        app.hw.update.side_effect = OSError("sensor driver failed")
-        App._tick(app)
-        app._drive.assert_called_once_with(None)
-        app.after.assert_called_once()
+        hw = Mock()
+        hw.update.side_effect = OSError("sensor driver failed")
+        header = Header(Mock(), Mock())
+        worker = FanWorker(hw, (("fan", header, None),))
+        worker.settings = (((), 0),)
+        worker.poll(time.monotonic())
+        header.write.assert_called_once_with(100)
+        self.assertIsNone(worker.snapshot[0])
+
+    def test_worker_drives_and_releases_without_a_ui_loop(self):
+        applied = threading.Event()
+        write_threads = []
+        release_threads = []
+
+        def write(value):
+            write_threads.append((threading.get_ident(), value))
+            applied.set()
+
+        header = Header(write, lambda: release_threads.append(threading.get_ident()))
+        hw = Mock()
+        hw.cpu_temp.return_value = 90
+        worker = FanWorker(hw, (("fan", header, None),))
+        worker.settings = (((), 0),)
+        worker.thread.start()
+        try:
+            self.assertTrue(applied.wait(2))
+        finally:
+            self.assertEqual(worker.finish(), [])
+        self.assertEqual(write_threads, [(worker.thread.ident, 100)])
+        self.assertEqual(release_threads, [worker.thread.ident])
+        self.assertNotEqual(worker.thread.ident, threading.get_ident())
+
+    def test_stop_during_blocked_update_prevents_new_write(self):
+        entered = threading.Event()
+        unblock = threading.Event()
+
+        def update():
+            entered.set()
+            if not unblock.wait(2):
+                raise TimeoutError("test update timed out")
+
+        hw = Mock()
+        hw.update.side_effect = update
+        hw.cpu_temp.return_value = 90
+        header = Header(Mock(), Mock())
+        worker = FanWorker(hw, (("fan", header, None),))
+        worker.settings = (((), 0),)
+        worker.thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+        finally:
+            worker.stop.set()
+            unblock.set()
+            worker.finish()
+        header.write.assert_not_called()
+        header.release.assert_not_called()
 
     def test_failed_restore_is_retried_and_write_fault_latches(self):
         write = Mock(side_effect=OSError("write"))
