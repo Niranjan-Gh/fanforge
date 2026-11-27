@@ -442,6 +442,42 @@ class CurveEditor(tk.Canvas):
             self.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#a74200", outline="", tags="live")
 
 
+def checkbox_images(style):
+    """Keep the classic layout and draw a clear tick for the selected state."""
+    images = []
+    tick = (
+        "      ##",
+        "     ###",
+        "#   ### ",
+        "## ###  ",
+        " ####   ",
+        "  ##    ",
+    )
+    for selected, disabled in ((False, False), (True, False),
+                               (False, True), (True, True)):
+        box = tk.PhotoImage(master=style.master, width=16, height=14)
+        box.put("#a5a091" if disabled else "#67819c", to=(0, 0, 13, 13))
+        box.put("#ece9d8" if disabled else "#e2ebf4", to=(1, 1, 12, 12))
+        box.put("#f3f1e8" if disabled else "#ffffff", to=(2, 2, 12, 12))
+        if selected:
+            color = "#777465" if disabled else "#205b24"
+            for y, line in enumerate(tick, start=3):
+                box.put("{" + " ".join(color if pixel == "#" else
+                                       "#f3f1e8" if disabled else "#ffffff"
+                                       for pixel in line) + "}", to=(3, y))
+        images.append(box)
+
+    unchecked, checked, disabled, disabled_checked = images
+    style.element_create("FanForge.indicator", "image", unchecked,
+                         ("disabled", "selected", disabled_checked),
+                         ("disabled", disabled), ("selected", checked))
+    layout = style.layout("TCheckbutton")
+    elements = layout[0][1]["children"][0][1]["children"][0][1]["children"]
+    elements[0] = ("FanForge.indicator", elements[0][1])
+    style.layout("TCheckbutton", layout)
+    return images
+
+
 # --------------------------------------------------------------------- app
 class App(tk.Tk):
     def __init__(self, hw):
@@ -456,6 +492,7 @@ class App(tk.Tk):
         self.option_add("*Font", ("Tahoma", 9))
         style = ttk.Style(self)
         style.theme_use("classic")
+        self.checkbox_images = checkbox_images(style)
         style.configure(".", background="#ece9d8", foreground="#18263a", font=("Tahoma", 9))
         style.configure("TButton", padding=(7, 3), relief="raised")
         style.configure("TNotebook.Tab", padding=(7, 3))
