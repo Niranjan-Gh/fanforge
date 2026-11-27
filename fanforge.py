@@ -19,7 +19,7 @@ import webbrowser
 from tkinter import messagebox, ttk
 
 APP_NAME = "FanForge"
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 UPDATE_REPO = "Niranjan-Gh/fanforge"   # filled in by publish.ps1
 TASK_NAME = "FanForge"
 
