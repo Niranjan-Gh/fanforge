@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.3.1
+- Run sensor polling and fan control in the background so moving the window does not interrupt control.
+- Update only the visible curve graph and skip unchanged labels.
+- Show an explicit tick when a checkbox is selected.
+
 ## 2.3.0
 - Require per-header opt-in, preserve existing curves, and leave recognized pump outputs under firmware control.
 - Request full duty on enabled fans during overheating, sensor failures, and late polls. Isolate failed headers and attempt firmware restore.
