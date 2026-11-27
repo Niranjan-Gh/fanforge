@@ -1,37 +1,34 @@
-# Downloads LibreHardwareMonitor and copies its DLLs into ..\lib
-# Usage:  .\scripts\fetch_lhm.ps1            (latest release)
-#         .\scripts\fetch_lhm.ps1 -Tag v0.9.4   (pin a specific release)
-param([string]$Tag = "")
-
+# Fetch the pinned .NET Framework release and verify the archive before extraction.
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+$tag = "v0.9.6"
+$sha256 = "086d9f1b5a99e643edc2cfaaac16051685b551e4c5ac0b32a57c58c0e529c001"
+$url = "https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases/download/$tag/LibreHardwareMonitor.zip"
 $dest = Join-Path (Split-Path $PSScriptRoot -Parent) "lib"
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
+$tmp = Join-Path ([IO.Path]::GetTempPath()) ("fanforge-lhm-" + [guid]::NewGuid())
+New-Item -ItemType Directory -Path $tmp | Out-Null
 
-$headers = @{ "User-Agent" = "FanForge" }
-if ($env:GITHUB_TOKEN) { $headers["Authorization"] = "Bearer $env:GITHUB_TOKEN" }
+try {
+    $zip = Join-Path $tmp "LibreHardwareMonitor.zip"
+    Invoke-WebRequest -Uri $url -OutFile $zip
+    if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $sha256) {
+        throw "LibreHardwareMonitor archive checksum mismatch."
+    }
+    $extract = Join-Path $tmp "extract"
+    Expand-Archive -LiteralPath $zip -DestinationPath $extract
+    $lib = Get-ChildItem -LiteralPath $extract -Recurse -Filter "LibreHardwareMonitorLib.dll" |
+        Select-Object -First 1
+    if (-not $lib) { throw "LibreHardwareMonitorLib.dll is missing from the verified archive." }
 
-$base = "https://api.github.com/repos/LibreHardwareMonitor/LibreHardwareMonitor/releases"
-$url = if ($Tag) { "$base/tags/$Tag" } else { "$base/latest" }
-Write-Host "Fetching LibreHardwareMonitor release info..." -ForegroundColor Cyan
-$rel = Invoke-RestMethod $url -Headers $headers
-
-$asset = $rel.assets | Where-Object { $_.name -like "*net472*.zip" } | Select-Object -First 1
-if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -eq "LibreHardwareMonitor.zip" } | Select-Object -First 1 }
-if (-not $asset) { $asset = $rel.assets | Where-Object { $_.name -like "*.zip" } | Select-Object -First 1 }
-if (-not $asset) { throw "No zip asset found on LibreHardwareMonitor release $($rel.tag_name)." }
-
-Write-Host "Downloading $($asset.name) ($($rel.tag_name))..." -ForegroundColor Cyan
-$zip = Join-Path $env:TEMP "lhm.zip"
-$tmp = Join-Path $env:TEMP "lhm_extract"
-Invoke-WebRequest $asset.browser_download_url -OutFile $zip
-if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force }
-Expand-Archive $zip -DestinationPath $tmp -Force
-
-$lib = Get-ChildItem $tmp -Recurse -Filter "LibreHardwareMonitorLib.dll" | Select-Object -First 1
-if (-not $lib) { throw "LibreHardwareMonitorLib.dll not found in the download." }
-
-Copy-Item (Join-Path $lib.DirectoryName "*.dll") $dest -Force
-Get-ChildItem $dest -Filter *.dll | Unblock-File
-Write-Host "Done: DLLs copied to $dest" -ForegroundColor Green
+    New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    Get-ChildItem -LiteralPath $dest -File -Filter "*.dll" | Remove-Item
+    Copy-Item (Join-Path $lib.DirectoryName "*.dll") $dest -Force
+    Get-ChildItem -LiteralPath $dest -Filter "*.dll" | Unblock-File
+} finally {
+    $tempRoot = (Resolve-Path -LiteralPath ([IO.Path]::GetTempPath())).Path.TrimEnd('\') + '\'
+    $resolved = (Resolve-Path -LiteralPath $tmp).Path
+    if ($resolved.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}

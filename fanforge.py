@@ -1,22 +1,24 @@
 """
 FanForge - automatic fan curves for CPU + case fans (Windows)
 
-Keep the app running (minimised is fine). When you close it, fans go back
-to BIOS control. Tick "Start with Windows" so curves are active after every
-boot.
+FanForge monitors by default. Only explicitly enabled fan headers are controlled.
 """
 import ctypes
 import json
+from copy import deepcopy
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import urllib.request
 import webbrowser
 from tkinter import messagebox, ttk
+
+from fanforge_safety import (ARMED_KEY, LINK_KEY, MIN_PCT, SAFE_TEMP, Header,
+                             fresh_temperature, valid_temperature, validate_config, write_config)
 
 APP_NAME = "FanForge"
 VERSION = "2.2.0"
@@ -34,11 +36,6 @@ LEGACY_CONFIGS = (
 )
 
 MASTER_KEY = "__master__"
-LINK_KEY = "__linked__"
-
-MIN_PCT = 20          # lowest speed a curve point can be set to
-SAFE_TEMP = 85        # at/above this CPU temp every fan goes to 100% instantly
-RAMP_DOWN = 2         # max % the fan may drop per tick (avoids speed hunting)
 POLL_MS = 1000
 DEFAULT_CURVE = [[30, 25], [45, 35], [60, 55], [70, 75], [80, 100]]
 PRESETS = {
@@ -57,7 +54,7 @@ def is_admin():
 
 
 def curve_value(points, t):
-    pts = sorted(points)
+    pts = points
     if t <= pts[0][0]:
         return pts[0][1]
     if t >= pts[-1][0]:
@@ -71,21 +68,15 @@ def curve_value(points, t):
 
 
 def load_config():
-    """Load saved curves. Migrates an old fan_config.json on first run."""
-    if not os.path.exists(CONFIG):
-        for old in LEGACY_CONFIGS:
-            if os.path.exists(old):
-                try:
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    shutil.copyfile(old, CONFIG)
-                except Exception:
-                    pass
-                break
+    source = next((path for path in (CONFIG, *LEGACY_CONFIGS)
+                   if os.path.isfile(path)), None)
+    if source is None:
+        return {}, ""
     try:
-        with open(CONFIG, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+        with open(source, encoding="utf-8-sig") as stream:
+            return validate_config(json.load(stream)), ""
+    except (OSError, ValueError) as exc:
+        return {}, f"Settings could not be loaded: {exc}"
 
 
 def pair_key(name):
@@ -93,11 +84,8 @@ def pair_key(name):
 
 
 def find_dll_dir():
-    for d in (os.path.join(RES_DIR, "lib"), RES_DIR, SCRIPT_DIR,
-              os.path.join(SCRIPT_DIR, "lib")):
-        if os.path.exists(os.path.join(d, "LibreHardwareMonitorLib.dll")):
-            return d
-    return None
+    directory = os.path.join(RES_DIR, "lib")
+    return directory if os.path.isfile(os.path.join(directory, "LibreHardwareMonitorLib.dll")) else None
 
 
 def parse_version(s):
@@ -121,7 +109,7 @@ def fetch_latest():
 # --------------------------------------------------- start with Windows
 def _run(args):
     return subprocess.run(args, capture_output=True, text=True,
-                          creationflags=0x08000000)  # CREATE_NO_WINDOW
+                          timeout=5, creationflags=0x08000000)  # CREATE_NO_WINDOW
 
 
 def launch_command():
@@ -177,20 +165,25 @@ class Hardware:
         self.pc.IsCpuEnabled = True
         self.pc.IsMotherboardEnabled = True
         self.pc.IsControllerEnabled = True
-        self.pc.Open()
+        try:
+            self.pc.Open()
 
-        self.cpu_temps, self.fans, self.controls = [], [], []
-        self.update()
-        for hw in self._walk():
-            hw_type = str(hw.HardwareType)
-            for s in hw.Sensors:
-                st = str(s.SensorType)
-                if st == "Temperature" and hw_type == "Cpu":
-                    self.cpu_temps.append(s)
-                elif st == "Fan":
-                    self.fans.append(s)
-                elif st == "Control" and s.Control is not None:
-                    self.controls.append(s)
+            self.cpu_temps, self.fans, self.controls = [], [], []
+            self.update()
+            for hw in self._walk():
+                hw_type = str(hw.HardwareType)
+                for s in hw.Sensors:
+                    st = str(s.SensorType)
+                    if st == "Temperature" and hw_type == "Cpu":
+                        self.cpu_temps.append(s)
+                    elif st == "Fan":
+                        self.fans.append(s)
+                    elif st == "Control" and s.Control is not None:
+                        self.controls.append(s)
+
+        except Exception:
+            self.close()
+            raise
 
     def _walk(self):
         for hw in self.pc.Hardware:
@@ -203,14 +196,16 @@ class Hardware:
             hw.Update()
 
     def cpu_temp(self):
-        vals = {s.Name: s.Value for s in self.cpu_temps if s.Value is not None}
-        if not vals:
-            return None
-        for name in ("CPU Package", "Core (Tctl/Tdie)", "CPU (Tctl/Tdie)",
-                     "Core Max", "Tctl/Tdie"):
-            if name in vals:
-                return float(vals[name])
-        return float(max(vals.values()))
+        preferred = {"CPU Package", "Core (Tctl/Tdie)", "CPU (Tctl/Tdie)",
+                     "Core Max", "Tctl/Tdie"}
+        values = []
+        for sensor in self.cpu_temps:
+            value = valid_temperature(sensor.Value)
+            if value is None and sensor.Name in preferred:
+                return None
+            if value is not None:
+                values.append(value)
+        return max(values, default=None)
 
     def rpm_for(self, control):
         hw_id = str(control.Hardware.Identifier)
@@ -223,22 +218,14 @@ class Hardware:
     @staticmethod
     def set_speed(control, pct):
         c = control.Control
-        try:
-            pct = max(float(c.MinSoftwareValue), min(float(c.MaxSoftwareValue), pct))
-        except Exception:
-            pass
-        c.SetSoftware(float(pct))
+        minimum, maximum = float(c.MinSoftwareValue), float(c.MaxSoftwareValue)
+        if not 0 <= minimum <= maximum <= 100 or maximum < 100:
+            raise ValueError("Controller does not advertise a 100% software range")
+        c.SetSoftware(float(max(minimum, pct)))
 
     @staticmethod
     def release(control):
-        try:
-            control.Control.SetDefault()
-        except Exception:
-            pass
-
-    def release_all(self):
-        for c in self.controls:
-            self.release(c)
+        control.Control.SetDefault()
 
     def close(self):
         try:
@@ -249,13 +236,13 @@ class Hardware:
 
 # ------------------------------------------------------------ curve editor
 class CurveEditor(tk.Canvas):
-    W, H = 480, 300
+    W, H = 466, 240
     L, R, T, B = 46, 16, 16, 34
     T0, T1 = 20, 100
 
     def __init__(self, master, points, on_change):
         super().__init__(master, width=self.W, height=self.H,
-                         bg="#14171c", highlightthickness=0)
+                         bg="#ffffff", highlightthickness=0, relief="sunken", borderwidth=2)
         self.points = [list(p) for p in points]
         self.on_change = on_change
         self.drag = None
@@ -284,8 +271,10 @@ class CurveEditor(tk.Canvas):
         self.draw()
 
     def set_live(self, temp):
+        if temp == self.live_temp:
+            return
         self.live_temp = temp
-        self.draw()
+        self.draw_live()
 
     def _nearest(self, e):
         best, best_d = None, 14
@@ -336,39 +325,57 @@ class CurveEditor(tk.Canvas):
         self.delete("all")
         for t in range(self.T0, self.T1 + 1, 10):
             x = self.tx(t)
-            self.create_line(x, self.T, x, self.H - self.B, fill="#262b33")
-            self.create_text(x, self.H - self.B + 14, text=f"{t}\u00b0", fill="#8a93a0",
-                             font=("Segoe UI", 8))
+            self.create_line(x, self.T, x, self.H - self.B, fill="#d8e3f0")
+            self.create_text(x, self.H - self.B + 14, text=f"{t}\u00b0", fill="#28466a",
+                             font=("Tahoma", 8))
         for p in range(0, 101, 20):
             y = self.ty(p)
-            self.create_line(self.L, y, self.W - self.R, y, fill="#262b33")
-            self.create_text(self.L - 6, y, text=f"{p}%", fill="#8a93a0",
-                             anchor="e", font=("Segoe UI", 8))
+            self.create_line(self.L, y, self.W - self.R, y, fill="#d8e3f0")
+            self.create_text(self.L - 6, y, text=f"{p}%", fill="#28466a",
+                             anchor="e", font=("Tahoma", 8))
         pts = sorted(self.points)
         flat = []
         for t, p in pts:
             flat += [self.tx(t), self.ty(p)]
         if len(flat) >= 4:
-            self.create_line(*flat, fill="#4cc9f0", width=2)
+            self.create_line(*flat, fill="#1458b0", width=2)
         for t, p in pts:
             x, y = self.tx(t), self.ty(p)
-            self.create_oval(x - 6, y - 6, x + 6, y + 6, fill="#4cc9f0", outline="#14171c", width=2)
+            self.create_oval(x - 6, y - 6, x + 6, y + 6, fill="#1458b0", outline="#ffffff", width=2)
+        self.draw_live()
+
+    def draw_live(self):
+        self.delete("live")
         if self.live_temp is not None:
             lt = max(self.T0, min(self.T1, self.live_temp))
             x = self.tx(lt)
-            self.create_line(x, self.T, x, self.H - self.B, fill="#ff9f43", dash=(4, 3))
-            y = self.ty(curve_value(pts, lt))
-            self.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#ff9f43", outline="")
+            self.create_line(x, self.T, x, self.H - self.B, fill="#a74200", dash=(4, 3), tags="live")
+            y = self.ty(curve_value(self.points, lt))
+            self.create_oval(x - 5, y - 5, x + 5, y + 5, fill="#a74200", outline="", tags="live")
 
 
 # --------------------------------------------------------------------- app
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, hw):
         super().__init__()
         self.title(f"{APP_NAME} {VERSION} - automatic fan curves")
         self.resizable(False, False)
-        self.hw = Hardware()
-        self.cfg = load_config()
+        self.hw = hw
+        self.cfg, self.config_error = load_config()
+        self.last_poll = None
+        self.tick_id = None
+        self.closing = False
+        self.configure(background="#ece9d8")
+        self.option_add("*Font", ("Tahoma", 9))
+        style = ttk.Style(self)
+        style.theme_use("classic")
+        style.configure(".", background="#ece9d8", foreground="#18263a", font=("Tahoma", 9))
+        style.configure("TButton", padding=(7, 3), relief="raised")
+        style.configure("TNotebook.Tab", padding=(7, 3))
+        style.map("TNotebook.Tab", background=[("selected", "#fcfaf0")])
+        style.configure("Status.TLabel", relief="sunken", padding=(6, 4))
+        tk.Label(self, text="FanForge  |  Cooling Control", bg="#2056a6", fg="white",
+                 font=("Tahoma", 11, "bold"), anchor="w", padx=9, pady=4).pack(fill="x")
         self.auto = tk.BooleanVar(value=True)
         self.linked = tk.BooleanVar(value=bool(self.cfg.get(LINK_KEY, False)))
         self.startup = tk.BooleanVar(value=startup_enabled())
@@ -381,16 +388,16 @@ class App(tk.Tk):
         head = ttk.Frame(self, padding=(12, 10))
         head.pack(fill="x")
         self.temp_var = tk.StringVar(value="--.- \u00b0C")
-        ttk.Label(head, text="CPU", font=("Segoe UI", 10)).pack(side="left")
+        ttk.Label(head, text="CPU", font=("Tahoma", 10)).pack(side="left")
         ttk.Label(head, textvariable=self.temp_var,
-                  font=("Segoe UI", 20, "bold")).pack(side="left", padx=(8, 20))
+                  font=("Tahoma", 20, "bold")).pack(side="left", padx=(8, 20))
         ttk.Checkbutton(head, text="Auto curves", variable=self.auto,
                         command=self._auto_toggled).pack(side="left")
         ttk.Button(head, text="Reset all to BIOS control",
                    command=self._reset_bios).pack(side="right")
 
-        self.status = tk.StringVar(value="")
-        ttk.Label(self, textvariable=self.status, foreground="#b45309").pack(
+        self.status = tk.StringVar(value=self.config_error)
+        ttk.Label(self, textvariable=self.status, style="Status.TLabel", wraplength=480).pack(
             fill="x", padx=12)
 
         if not self.hw.controls:
@@ -427,7 +434,7 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         if "--minimized" in sys.argv:
             self.iconify()
-        self.after(200, self._tick)
+        self.tick_id = self.after(200, self._tick)
         self.after(4000, lambda: self._check_updates(manual=False))
 
     # ---- tabs
@@ -475,9 +482,38 @@ class App(tk.Tk):
         ttk.Button(btns, text="Copy curve to all fans",
                    command=lambda: self._copy_to_all(editor)).pack(side="left", padx=6)
 
-        self.rows.append({"control": control, "id": cid, "editor": editor,
-                          "rpm": self.hw.rpm_for(control), "rpm_var": rpm_var,
-                          "pct_var": pct_var, "note_var": note_var, "current": None})
+        pump = "pump" in f"{control.Name} {cid}".lower()
+        enabled = tk.BooleanVar(value=not pump and cid in self.cfg.get(ARMED_KEY, []))
+        header = Header(lambda pct: self.hw.set_speed(control, pct),
+                        lambda: self.hw.release(control))
+        row = {"id": cid, "editor": editor, "enabled": enabled, "header": header,
+               "rpm": self.hw.rpm_for(control), "rpm_var": rpm_var,
+               "pct_var": pct_var, "note_var": note_var}
+        toggle = ttk.Checkbutton(frame, text="Allow software control",
+                                 variable=enabled, command=lambda: self._enable_header(row))
+        toggle.grid(row=4, column=0, columnspan=3, sticky="w")
+        if pump:
+            toggle.state(["disabled"])
+            note_var.set("Pump header stays under firmware control.")
+            row["pump"] = True
+        self.rows.append(row)
+
+    def _enable_header(self, row):
+        enabled, header = row["enabled"], row["header"]
+        if enabled.get():
+            if not messagebox.askyesno(
+                APP_NAME, "Confirm this output is a verified fan header without a pump "
+                "and the fan can run at the minimum duty in its curve. Enable software control?"
+            ):
+                enabled.set(False)
+                return
+            if header.restore():
+                header.fault = ""
+        else:
+            header.restore()
+        if not self._save():
+            enabled.set(False)
+            header.restore()
 
     def _copy_to_all(self, src):
         for r in self.rows:
@@ -486,16 +522,24 @@ class App(tk.Tk):
 
     # ---- settings / startup / updates
     def _save(self):
-        data = {r["id"]: r["editor"].points for r in self.rows}
+        data = dict(self.cfg)
+        data.update({r["id"]: r["editor"].points for r in self.rows})
         if self.master_editor is not None:
             data[MASTER_KEY] = self.master_editor.points
-        data[LINK_KEY] = bool(self.linked.get())
+        data[LINK_KEY] = self.linked.get()
+        detected = {r["id"] for r in self.rows}
+        enabled = set(data.get(ARMED_KEY, [])) - detected
+        enabled.update(r["id"] for r in self.rows if r["enabled"].get())
+        data[ARMED_KEY] = sorted(enabled)
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-        except Exception:
-            pass
+            write_config(CONFIG, data)
+        except (OSError, ValueError) as exc:
+            self.config_error = f"Settings could not be saved: {exc}"
+            self.status.set(self.config_error)
+            return False
+        self.cfg = deepcopy(data)
+        self.config_error = ""
+        return True
 
     def _startup_toggled(self):
         want = self.startup.get()
@@ -546,72 +590,140 @@ class App(tk.Tk):
             self._reset_bios(keep_auto=True)
 
     def _reset_bios(self, keep_auto=False):
-        self.hw.release_all()
-        for r in self.rows:
-            r["current"] = None
-            r["pct_var"].set("BIOS")
         if not keep_auto:
             self.auto.set(False)
+        self.smooth = None
+        for row in self.rows:
+            restored = row["header"].restore()
+            row["pct_var"].set("BIOS" if restored else "Fault")
+
+    def _drive(self, raw):
+        emergency = raw is None or raw >= SAFE_TEMP
+        if emergency or self.smooth is None:
+            self.smooth = raw
+        else:
+            self.smooth = 0.6 * self.smooth + 0.4 * raw
+        active = self.auto.get()
+        linked = self.linked.get() if not emergency else False
+        for row in self.rows:
+            header = row["header"]
+            if active and row["enabled"].get():
+                if emergency:
+                    header.apply(100, emergency=True)
+                else:
+                    points = self.master_editor.points if linked else row["editor"].points
+                    header.apply(curve_value(points, max(raw, self.smooth)))
+            else:
+                header.restore()
 
     def _tick(self):
+        started = time.monotonic()
+        raw = None
+        warning = ""
         try:
-            self.hw.update()
-            raw = self.hw.cpu_temp()
+            try:
+                self.hw.update()
+                raw = fresh_temperature(self.hw.cpu_temp(), started, time.monotonic(),
+                                        self.last_poll)
+                self.last_poll = started
+            except Exception:
+                self.last_poll = None
             if raw is None:
-                self.temp_var.set("n/a")
-                self.status.set("Can't read CPU temperature - fans forced to 100% for safety.")
-            else:
-                self.temp_var.set(f"{raw:.1f} \u00b0C")
-                self.status.set("")
-                self.smooth = raw if self.smooth is None else 0.6 * self.smooth + 0.4 * raw
-            live = self.smooth if raw is not None else None
-            linked = self.linked.get() and self.master_editor is not None
+                warning = "CPU reading unavailable or late. Requesting full speed on enabled fans."
+            elif raw >= SAFE_TEMP:
+                warning = "CPU temperature is high. Requesting full speed on enabled fans."
+            self._drive(raw)
+            self.temp_var.set("N/A" if raw is None else f"{raw:.1f} °C")
             if self.master_editor is not None:
-                self.master_editor.set_live(live)
-            for r in self.rows:
-                r["editor"].set_live(live)
-                r["note_var"].set("Linked: this fan is following the \u2605 All fans curve." if linked else "")
-                rpm = r["rpm"]
-                r["rpm_var"].set(f"{int(rpm.Value)} RPM" if rpm is not None and rpm.Value is not None else "")
-                if not self.auto.get():
-                    continue
-                points = self.master_editor.points if linked else r["editor"].points
-                if raw is None or raw >= SAFE_TEMP:
-                    target, panic = 100, True
-                else:
-                    target, panic = curve_value(points, self.smooth), False
-                cur = r["current"]
-                if cur is None or panic or target >= cur:
-                    cur = target
-                else:
-                    cur = max(target, cur - RAMP_DOWN)
-                r["current"] = cur
-                self.hw.set_speed(r["control"], cur)
-                r["pct_var"].set(f"{cur:.0f}%")
-        except Exception as e:  # never let the loop die - keep fans safe
-            self.status.set(f"Error: {e}")
+                self.master_editor.set_live(raw)
+            for row in self.rows:
+                row["editor"].set_live(raw)
+                header = row["header"]
+                note = header.fault or ("Pump header stays under firmware control."
+                                        if row.get("pump") else "")
+                if header.owned and header.current is None:
+                    note = "Firmware restore failed. " + note
+                row["note_var"].set(note[:76])
+                row["pct_var"].set("Fault" if note and not row.get("pump") else
+                                   "BIOS" if header.current is None else f"{header.current}%")
+                try:
+                    rpm = row["rpm"]
+                    value = int(rpm.Value) if rpm is not None and rpm.Value is not None else None
+                except Exception:
+                    value = None
+                row["rpm_var"].set(f"{value} RPM" if value is not None and value >= 0 else "")
+            if any(row["header"].fault or (
+                row["header"].owned and row["header"].current is None
+            ) for row in self.rows):
+                warning = "Fan header fault. Check the affected header tab."
+            self.status.set(warning or self.config_error or "Monitoring CPU temperature")
+        except Exception:
+            self._drive(None)
+            self.status.set("Control loop error. Requesting full speed on enabled fans.")
         finally:
-            self.after(POLL_MS, self._tick)
+            if not self.closing:
+                self.tick_id = self.after(max(1, POLL_MS - int(
+                    (time.monotonic() - started) * 1000)), self._tick)
+
+    def report_callback_exception(self, exc_type, exc, traceback):
+        self._reset_bios()
+        self.status.set(f"Interface error. Automatic control paused: {exc}")
 
     def _close(self):
-        self._save()
-        self.hw.release_all()
-        self.hw.close()
+        self.closing = True
+        if self.tick_id is not None:
+            self.after_cancel(self.tick_id)
+        self._reset_bios()
         self.destroy()
 
+    def release_headers(self):
+        failures = []
+        for row in self.rows:
+            if not row["header"].restore():
+                failures.append(row["id"])
+        return failures
 
 def main():
     if not is_admin():
         args = sys.argv[1:] if FROZEN else sys.argv
-        params = " ".join(f'"{a}"' for a in args)
+        params = subprocess.list2cmdline(args)
         ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
         return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = (ctypes.c_void_p,)
+    handle = kernel.CreateMutexW(None, False, r"Global\FanForge.HardwareControl")
+    error = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(error)
+    hw = app = None
+    failure = None
     try:
-        App().mainloop()
-    except Exception as e:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(APP_NAME, str(e))
+        if error == 183:  # ERROR_ALREADY_EXISTS
+            if "--minimized" not in sys.argv:
+                ctypes.windll.user32.MessageBoxW(None, "FanForge is already running.", APP_NAME, 0)
+            return
+        hw = Hardware()
+        app = App(hw)
+        app.mainloop()
+    except Exception as exc:
+        failure = str(exc)
+    finally:
+        failures = []
+        try:
+            if app is not None:
+                failures = app.release_headers()
+        finally:
+            if hw is not None:
+                hw.close()
+            kernel.CloseHandle(handle)
+        if failures:
+            ctypes.windll.user32.MessageBoxW(
+                None, "Firmware control could not be confirmed for:\n" + "\n".join(failures),
+                APP_NAME, 0x10)
+    if failure:
+        ctypes.windll.user32.MessageBoxW(None, failure, APP_NAME, 0x10)
 
 
 if __name__ == "__main__":
