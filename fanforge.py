@@ -234,6 +234,94 @@ class Hardware:
             pass
 
 
+class FanWorker:
+    """Runs driver calls and fan control independently of the Tk event loop."""
+
+    def __init__(self, hw, outputs):
+        self.hw = hw
+        self.outputs = outputs
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="FanForge hardware")
+        self.settings = ()
+        self.snapshot = None
+        self.failures = []
+        self.last_poll = None
+        self.smooth = None
+        self.rearmed = {}
+
+    def run(self):
+        try:
+            while not self.stop.is_set():
+                started = time.monotonic()
+                self.poll(started)
+                self.stop.wait(max(0, POLL_MS / 1000 - (time.monotonic() - started)))
+        finally:
+            for cid, header, _ in self.outputs:
+                if not header.restore() and not header.restore():
+                    self.failures.append(cid)
+
+    def poll(self, started):
+        try:
+            self.hw.update()
+            raw = fresh_temperature(self.hw.cpu_temp(), started, time.monotonic(),
+                                    self.last_poll)
+            self.last_poll = started
+        except Exception:
+            raw = None
+            self.last_poll = None
+        settings = self.settings
+        warning = ""
+        if raw is None:
+            warning = "CPU reading unavailable or late. Requesting full speed on enabled fans."
+        elif raw >= SAFE_TEMP:
+            warning = "CPU temperature is high. Requesting full speed on enabled fans."
+        try:
+            self.drive(raw, settings)
+        except Exception:
+            self.drive(None, settings)
+            warning = "Control loop error. Requesting full speed on enabled fans."
+        readings = []
+        for _, header, rpm in self.outputs:
+            note = header.fault
+            if header.owned and header.current is None:
+                note = "Firmware restore failed. " + note
+            try:
+                value = rpm.Value if rpm is not None else None
+                rpm_text = f"{int(value)} RPM" if value is not None and value >= 0 else ""
+            except Exception:
+                rpm_text = ""
+            readings.append((header.current, note, rpm_text))
+        if any(note for _, note, _ in readings):
+            warning = "Fan header fault. Check the affected header tab."
+        # A single immutable snapshot replaces the previous one. No UI backlog.
+        self.snapshot = (raw, warning, tuple(readings))
+
+    def drive(self, raw, settings):
+        emergency = raw is None or raw >= SAFE_TEMP
+        if emergency or self.smooth is None:
+            self.smooth = raw
+        else:
+            self.smooth = 0.6 * self.smooth + 0.4 * raw
+        for (cid, header, _), (points, generation) in zip(self.outputs, settings):
+            if self.stop.is_set():
+                return
+            if points is None:
+                header.restore()
+                continue
+            if generation != self.rearmed.get(cid, 0) and header.restore():
+                header.fault = ""
+                self.rearmed[cid] = generation
+            if emergency:
+                header.apply(100, emergency=True)
+            else:
+                header.apply(curve_value(points, max(raw, self.smooth)))
+
+    def finish(self):
+        self.stop.set()
+        self.thread.join()
+        return self.failures
+
+
 # ------------------------------------------------------------ curve editor
 class CurveEditor(tk.Canvas):
     W, H = 466, 240
@@ -362,7 +450,6 @@ class App(tk.Tk):
         self.resizable(False, False)
         self.hw = hw
         self.cfg, self.config_error = load_config()
-        self.last_poll = None
         self.tick_id = None
         self.closing = False
         self.configure(background="#ece9d8")
@@ -379,7 +466,6 @@ class App(tk.Tk):
         self.auto = tk.BooleanVar(value=True)
         self.linked = tk.BooleanVar(value=bool(self.cfg.get(LINK_KEY, False)))
         self.startup = tk.BooleanVar(value=startup_enabled())
-        self.smooth = None
         self.rows = []
         self.master_editor = None
         self._update_result = None
@@ -434,8 +520,13 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._close)
         if "--minimized" in sys.argv:
             self.iconify()
+        outputs = tuple((r["id"], r.pop("header"), r.pop("rpm")) for r in self.rows)
+        self.worker = FanWorker(hw, outputs)
+        self.rendered = None
+        self._publish_settings()
         self.tick_id = self.after(200, self._tick)
         self.after(4000, lambda: self._check_updates(manual=False))
+        self.worker.thread.start()
 
     # ---- tabs
     def _build_master_tab(self, nb):
@@ -488,7 +579,7 @@ class App(tk.Tk):
                         lambda: self.hw.release(control))
         row = {"id": cid, "editor": editor, "enabled": enabled, "header": header,
                "rpm": self.hw.rpm_for(control), "rpm_var": rpm_var,
-               "pct_var": pct_var, "note_var": note_var}
+               "pct_var": pct_var, "note_var": note_var, "generation": 0}
         toggle = ttk.Checkbutton(frame, text="Allow software control",
                                  variable=enabled, command=lambda: self._enable_header(row))
         toggle.grid(row=4, column=0, columnspan=3, sticky="w")
@@ -499,7 +590,7 @@ class App(tk.Tk):
         self.rows.append(row)
 
     def _enable_header(self, row):
-        enabled, header = row["enabled"], row["header"]
+        enabled = row["enabled"]
         if enabled.get():
             if not messagebox.askyesno(
                 APP_NAME, "Confirm this output is a verified fan header without a pump "
@@ -507,13 +598,10 @@ class App(tk.Tk):
             ):
                 enabled.set(False)
                 return
-            if header.restore():
-                header.fault = ""
-        else:
-            header.restore()
-        if not self._save():
+            row["generation"] += 1
+        if not self._save(publish_on_error=False):
             enabled.set(False)
-            header.restore()
+            self._publish_settings()
 
     def _copy_to_all(self, src):
         for r in self.rows:
@@ -521,7 +609,7 @@ class App(tk.Tk):
         self._save()
 
     # ---- settings / startup / updates
-    def _save(self):
+    def _save(self, publish_on_error=True):
         data = dict(self.cfg)
         data.update({r["id"]: r["editor"].points for r in self.rows})
         if self.master_editor is not None:
@@ -536,9 +624,12 @@ class App(tk.Tk):
         except (OSError, ValueError) as exc:
             self.config_error = f"Settings could not be saved: {exc}"
             self.status.set(self.config_error)
+            if publish_on_error:
+                self._publish_settings()
             return False
         self.cfg = deepcopy(data)
         self.config_error = ""
+        self._publish_settings()
         return True
 
     def _startup_toggled(self):
@@ -549,7 +640,7 @@ class App(tk.Tk):
             messagebox.showerror(APP_NAME, f"Couldn't change the startup task:\n{msg}")
 
     def _check_updates(self, manual):
-        if self._checking:
+        if self._checking or self.closing:
             return
         self._checking = True
         self._update_result = None
@@ -564,6 +655,8 @@ class App(tk.Tk):
         self.after(400, lambda: self._poll_update(manual))
 
     def _poll_update(self, manual):
+        if self.closing:
+            return
         res = self._update_result
         if res is None:
             self.after(400, lambda: self._poll_update(manual))
@@ -585,103 +678,66 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, f"You're up to date (v{VERSION}).")
 
     # ---- fan control
-    def _auto_toggled(self):
-        if not self.auto.get():
-            self._reset_bios(keep_auto=True)
-
-    def _reset_bios(self, keep_auto=False):
-        if not keep_auto:
-            self.auto.set(False)
-        self.smooth = None
-        for row in self.rows:
-            restored = row["header"].restore()
-            row["pct_var"].set("BIOS" if restored else "Fault")
-
-    def _drive(self, raw):
-        emergency = raw is None or raw >= SAFE_TEMP
-        if emergency or self.smooth is None:
-            self.smooth = raw
-        else:
-            self.smooth = 0.6 * self.smooth + 0.4 * raw
+    def _publish_settings(self):
+        linked = self.master_editor if self.linked.get() else None
         active = self.auto.get()
-        linked = self.linked.get() if not emergency else False
-        for row in self.rows:
-            header = row["header"]
-            if active and row["enabled"].get():
-                if emergency:
-                    header.apply(100, emergency=True)
-                else:
-                    points = self.master_editor.points if linked else row["editor"].points
-                    header.apply(curve_value(points, max(raw, self.smooth)))
-            else:
-                header.restore()
+        self.worker.settings = tuple(
+            (tuple(tuple(point) for point in (linked or row["editor"]).points)
+             if active and row["enabled"].get() else None, row["generation"])
+            for row in self.rows
+        )
+
+    def _auto_toggled(self):
+        self._publish_settings()
+
+    def _reset_bios(self):
+        self.auto.set(False)
+        self._publish_settings()
 
     def _tick(self):
-        started = time.monotonic()
-        raw = None
-        warning = ""
+        if self.closing:
+            if self.worker.thread.is_alive():
+                self.tick_id = self.after(200, self._tick)
+            else:
+                self.destroy()
+            return
         try:
-            try:
-                self.hw.update()
-                raw = fresh_temperature(self.hw.cpu_temp(), started, time.monotonic(),
-                                        self.last_poll)
-                self.last_poll = started
-            except Exception:
-                self.last_poll = None
-            if raw is None:
-                warning = "CPU reading unavailable or late. Requesting full speed on enabled fans."
-            elif raw >= SAFE_TEMP:
-                warning = "CPU temperature is high. Requesting full speed on enabled fans."
-            self._drive(raw)
-            self.temp_var.set("N/A" if raw is None else f"{raw:.1f} °C")
-            if self.master_editor is not None:
-                self.master_editor.set_live(raw)
-            for row in self.rows:
-                row["editor"].set_live(raw)
-                header = row["header"]
-                note = header.fault or ("Pump header stays under firmware control."
-                                        if row.get("pump") else "")
-                if header.owned and header.current is None:
-                    note = "Firmware restore failed. " + note
-                row["note_var"].set(note[:76])
-                row["pct_var"].set("Fault" if note and not row.get("pump") else
-                                   "BIOS" if header.current is None else f"{header.current}%")
-                try:
-                    rpm = row["rpm"]
-                    value = int(rpm.Value) if rpm is not None and rpm.Value is not None else None
-                except Exception:
-                    value = None
-                row["rpm_var"].set(f"{value} RPM" if value is not None and value >= 0 else "")
-            if any(row["header"].fault or (
-                row["header"].owned and row["header"].current is None
-            ) for row in self.rows):
-                warning = "Fan header fault. Check the affected header tab."
-            self.status.set(warning or self.config_error or "Monitoring CPU temperature")
-        except Exception:
-            self._drive(None)
-            self.status.set("Control loop error. Requesting full speed on enabled fans.")
+            snapshot = self.worker.snapshot
+            if snapshot is None:
+                return
+            raw, warning, readings = snapshot
+            if snapshot is not self.rendered:
+                self.rendered = snapshot
+                self._set_text(self.temp_var, "N/A" if raw is None else f"{raw:.1f} ?C")
+                for row, (current, note, rpm) in zip(self.rows, readings):
+                    self._set_text(row["note_var"], note[:76] or (
+                        "Pump header stays under firmware control." if row.get("pump") else ""))
+                    self._set_text(row["pct_var"], "Fault" if note else
+                                   "BIOS" if current is None else f"{current}%")
+                    self._set_text(row["rpm_var"], rpm)
+            self._set_text(self.status, warning or self.config_error or "Monitoring CPU temperature")
+            for editor in (self.master_editor, *(row["editor"] for row in self.rows)):
+                if editor is not None and editor.winfo_viewable():
+                    editor.set_live(raw)
+                    break
         finally:
-            if not self.closing:
-                self.tick_id = self.after(max(1, POLL_MS - int(
-                    (time.monotonic() - started) * 1000)), self._tick)
+            self.tick_id = self.after(200, self._tick)
+
+    @staticmethod
+    def _set_text(variable, value):
+        if variable.get() != value:
+            variable.set(value)
 
     def report_callback_exception(self, exc_type, exc, traceback):
         self._reset_bios()
-        self.status.set(f"Interface error. Automatic control paused: {exc}")
+        self.config_error = f"Interface error. Automatic control paused: {exc}"
+        self.status.set(self.config_error)
 
     def _close(self):
         self.closing = True
-        if self.tick_id is not None:
-            self.after_cancel(self.tick_id)
-        self._reset_bios()
-        self.destroy()
+        self.worker.stop.set()
+        self.status.set("Restoring firmware control. Waiting for the hardware driver?")
 
-    def release_headers(self):
-        failures = []
-        for row in self.rows:
-            if not row["header"].restore():
-                failures.append(row["id"])
-        return failures
 
 def main():
     if not is_admin():
@@ -713,7 +769,7 @@ def main():
         failures = []
         try:
             if app is not None:
-                failures = app.release_headers()
+                failures = app.worker.finish()
         finally:
             if hw is not None:
                 hw.close()
