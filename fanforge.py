@@ -21,7 +21,7 @@ from fanforge_safety import (ARMED_KEY, LINK_KEY, MIN_PCT, SAFE_TEMP, Header,
                              fresh_temperature, valid_temperature, validate_config, write_config)
 
 APP_NAME = "FanForge"
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 UPDATE_REPO = "Niranjan-Gh/fanforge"   # filled in by publish.ps1
 TASK_NAME = "FanForge"
 
